@@ -460,7 +460,7 @@ func (p *Processor) fetch(ctx context.Context, job, snap *queue.Job, resolved []
 	stopped := false
 	if anyKept {
 		mode := p.archiveMode(snap, resolved, site, cbz, deep)
-		downloaded, dlErr = p.runner.Download(ctx, snap.URL, fetchRange, workDir, mode, onFile, deep)
+		downloaded, dlErr = p.download(ctx, snap, resolved, blacklisted, site, workDir, fetchRange, cbz, deep, mode, onFile)
 		stopped = mode == gdl.ArchiveCatchUp && gdl.CaughtUp(downloaded)
 	}
 	if ctx.Err() != nil {
@@ -566,6 +566,82 @@ func keptRange(rng string, offset, total int, blacklisted map[int]string) (strin
 		}
 	}
 	return gdl.PositionRange(kept), len(kept) > 0
+}
+
+// A search window past the first is fetched post by post. --range only
+// filters what gallery-dl yields, and for the booru extractors that fetch each
+// post's page for per-category tags, every post before the window is fetched
+// too: window N would walk N-1 posts again, and the jobs together walk
+// O(N^2). The resolve pass already listed this window's posts, so each is
+// downloaded from its own URL: one page fetch per post, whatever the offset.
+func (p *Processor) download(ctx context.Context, snap *queue.Job, resolved []gdl.Item, blacklisted map[int]string, site, workDir, rng string, cbz, deep bool, mode gdl.Archive, onFile func(gdl.Downloaded)) ([]gdl.Downloaded, error) {
+	urls, ok := p.windowPostURLs(snap, resolved, blacklisted, site, rng, cbz, deep)
+	if !ok {
+		return p.runner.Download(ctx, snap.URL, rng, workDir, mode, onFile, deep)
+	}
+	var all []gdl.Downloaded
+	var firstErr error
+	for _, u := range urls {
+		if ctx.Err() != nil {
+			return all, ctx.Err()
+		}
+		dls, err := p.runner.Download(ctx, u, "", workDir, mode, onFile, false)
+		all = append(all, dls...)
+		if err == nil {
+			continue
+		}
+		if ctx.Err() != nil {
+			return all, err
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		switch errorCode(err) {
+		case outcome.ErrCodeRateLimited, outcome.ErrCodeBlocked, outcome.ErrCodeAuthRequired, outcome.ErrCodeNetworkUnreachable:
+			// The next post would meet the same wall; the rest fail with this error.
+			return all, firstErr
+		}
+	}
+	return all, firstErr
+}
+
+// The post URLs of a search window, or false when the window must go through
+// the search URL: a first window walks nothing extra, a watch relies on its
+// archive catch-up, and a site whose listing already carries everything gains
+// nothing from one request per post. Only the sites monloader asks gallery-dl
+// to fetch a page per post for (tags:true) pay for the walk.
+func (p *Processor) windowPostURLs(snap *queue.Job, resolved []gdl.Item, blacklisted map[int]string, site, rng string, cbz, deep bool) ([]string, bool) {
+	if cbz || deep || rng == "" || snap.Watch != 0 || snap.Offset <= 0 || len(resolved) == 0 {
+		return nil, false
+	}
+	if !slices.Contains(p.mapper.FlatTagSites(), site) {
+		return nil, false
+	}
+	return postURLsOf(resolved, blacklisted, p.mapper.PostURLFor)
+}
+
+// A pool, a book or a multi-file post is one work and is not split. A row the
+// blacklist dropped is not downloaded.
+func postURLsOf(resolved []gdl.Item, blacklisted map[int]string, postURL func(category, id string) string) ([]string, bool) {
+	urls := make([]string, 0, len(resolved))
+	seen := make(map[string]bool, len(resolved))
+	for i, it := range resolved {
+		if _, out := blacklisted[i]; out {
+			continue
+		}
+		if it.Subcategory == "pool" || it.ID == "" || it.Num > 1 {
+			return nil, false
+		}
+		u := postURL(it.Category, it.ID)
+		if u == "" {
+			return nil, false
+		}
+		if !seen[u] {
+			seen[u] = true
+			urls = append(urls, u)
+		}
+	}
+	return urls, true
 }
 
 type postKey struct {
