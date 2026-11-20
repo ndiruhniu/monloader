@@ -585,10 +585,8 @@ func keptRange(rng string, offset, total int, blacklisted map[int]string) (strin
 func (p *Processor) download(ctx context.Context, snap *queue.Job, resolved []gdl.Item, blacklisted map[int]string, site, workDir, rng string, cbz, deep bool, mode gdl.Archive, onFile func(gdl.Downloaded)) ([]gdl.Downloaded, error) {
 	urls, why := p.windowPostURLs(snap, resolved, blacklisted, site, rng, cbz, deep)
 	if why != "" {
-		logx.Debugf("queue: job %d window %q goes through the search URL: %s", snap.ID, rng, why)
 		return p.runner.Download(ctx, snap.URL, rng, workDir, mode, onFile, deep)
 	}
-	logx.Infof("queue: job %d window %q fetched post by post (%d posts)", snap.ID, rng, len(urls))
 	var all []gdl.Downloaded
 	var firstErr error
 	for _, u := range urls {
@@ -597,6 +595,11 @@ func (p *Processor) download(ctx context.Context, snap *queue.Job, resolved []gd
 		}
 		dls, err := p.runner.Download(ctx, u, "", workDir, mode, onFile, false)
 		all = append(all, dls...)
+		// A watch stops where its newest-first listing reaches the previous
+		// fetch: the same run of recorded posts that ends a search run.
+		if mode == gdl.ArchiveCatchUp && gdl.CaughtUp(all) {
+			return all, firstErr
+		}
 		if err == nil {
 			continue
 		}
@@ -616,18 +619,16 @@ func (p *Processor) download(ctx context.Context, snap *queue.Job, resolved []gd
 }
 
 // The post URLs of a search window, or why not when the window must go through
-// the search URL: a first window walks nothing extra, a watch relies on its
-// archive catch-up, and a site whose listing already carries everything gains
-// nothing from one request per post. Only the sites monloader asks gallery-dl
-// to fetch a page per post for (tags:true) pay for the walk.
+// the search URL: a first window walks nothing extra, and a site whose listing
+// already carries everything gains nothing from one request per post. Only the
+// sites monloader asks gallery-dl to fetch a page per post for (tags:true) pay
+// for the walk.
 func (p *Processor) windowPostURLs(snap *queue.Job, resolved []gdl.Item, blacklisted map[int]string, site, rng string, cbz, deep bool) ([]string, string) {
 	switch {
 	case cbz || deep:
 		return nil, "a book or a deep pass"
 	case rng == "" || len(resolved) == 0:
 		return nil, "no window"
-	case snap.Watch != 0:
-		return nil, "a watch"
 	case snap.Offset <= 0:
 		return nil, "the first window"
 	case !slices.Contains(p.mapper.FlatTagSites(), site):
